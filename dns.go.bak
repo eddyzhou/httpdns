@@ -1,0 +1,95 @@
+package main
+
+import (
+	"fmt"
+	"net"
+	"log"
+
+	"github.com/miekg/dns"
+)
+
+// CNAME -> A 
+func Lookup(host, dnsServer string) (*net.IP, error) {
+	addrs, err := resolveDns("CNAME", host, dnsServer)
+	if err != nil {
+		return nil, err
+	}
+
+	for {
+		if len(addrs.Answer) == 0 {
+			break
+		}
+		host = addrs.Answer[0].(*dns.CNAME).Target
+		addrs, err = resolveDns("CNAME", host, dnsServer)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	addrs, err = resolveDns("A", host, dnsServer)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, a := range addrs.Answer {
+		if a.(*dns.A).A != nil {
+			return &a.(*dns.A).A
+		}
+	}
+
+	return nil, fmt.Errorf("Not found")
+}
+
+func resolveDns(ctype, host, dnsServer string) (*dns.Msg, error) {
+	itype, ok := dns.StringToType[ctype]
+	if !ok {
+		return nil, fmt.Errorf("Invalid type %s", ctype)
+	}
+
+	host = dns.Fqdn(host)
+	client := &dns.Client{}
+	msg := &dns.Msg{}
+	msg.SetQuestion(host, itype)
+
+	response, err := resolve(msg, client, dnsServer, false)
+	if err != nil {
+		return response, err
+	}
+
+	return response, nil
+}
+
+func resolve(msg *dns.Msg, client *dns.Client, server string, edns bool) (*dns.Msg, error) {
+	if edns {
+		opt := &dns.OPT{
+			Hdr: dns.RR_Header{
+				Name:   ".",
+				Rrtype: dns.TypeOPT,
+			},
+		}
+		opt.SetUDPSize(dns.DefaultMsgSize)
+		msg.Extra = append(msg.Extra, opt)
+	}
+
+	response, _, err := client.Exchange(msg, server)
+	if err != nil {
+		return nil, err
+	}
+
+	if msg.Id != response.Id {
+		return nil, fmt.Errorf("DNS ID mismatch, request: %d, response: %d!", msg.Id, response.Id)
+	}
+
+	if response.MsgHdr.Truncated {
+		if client.Net == "tcp" {
+			return nil, fmt.Errorf("Got truncated message on tcp")
+		}
+		if edns {
+			client.Net = "tcp"
+		}
+
+		return resolve(msg, client, server, !edns)
+	}
+	
+	return response, nil
+}
